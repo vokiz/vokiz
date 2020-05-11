@@ -6,11 +6,14 @@ import readline
 import roax.context
 import roax.schema as s
 import shlex
+import vokiz.backends
+import vokiz.backends.none
 import vokiz.resource
 import vokiz.schema as vs
 import wrapt
 
 from dataclasses import dataclass, field
+from vokiz.backends import BackendError
 
 
 class Error(Exception):
@@ -30,8 +33,9 @@ class cmd:
 
     _str = s.str()
 
-    def __init__(self, auth=None):
+    def __init__(self, auth=None, name=None):
         self.auth = auth or (lambda: True)
+        self.name = name
 
     def __call__(self, function):
         function._command = self
@@ -54,11 +58,13 @@ class cmd:
                     except s.SchemaError:
                         raise Error(f"Invalid {name}: {arg}.")
                 elif param.kind == param.VAR_KEYWORD:
-                    try:
-                        key, value = arg.split("=", 1)
-                    except ValueError:
-                        raise Error(f"Invalid key-value: {arg}")
-                    _kwargs[key] = value
+                    for arg in args:
+                        try:
+                            key, value = arg.split("=", 1)
+                        except ValueError:
+                            raise Error(f"Invalid key-value: {arg}")
+                        _kwargs[key] = value
+                    args.clear()
                 else:
                     raise TypeError("unsupported command parameter type")
             if args:
@@ -75,18 +81,28 @@ def ctx(type):
         return c.get(type)
 
 
-def listing(strings):
-    """Return a string listing of strings for display in command output."""
-    return " ".join(sorted(strings, key=str.lower)) if strings else "[none]"
+def _str_list(l):
+    """Return a string representing list of strings."""
+    return " ".join(sorted(l, key=str.lower)) if l else "[none]"
+
+
+def _str_dict(d):
+    """Return a string representing dict of strings to strings."""
+    return " ".join([f"{k}={v}" for k, v in d.items()]) if d else "[none]"
+
+
+def _str_dataclass(o):
+    """Return a string representing attributes in a dataclass."""
+    return _str_dict({attr: getattr(o, attr) for attr in o.__annotations__})
 
 
 class auth:
     """Command authorization functions."""
 
     @staticmethod
-    def repl():
-        """Authorize command if requested through REPL."""
-        return roax.context.last(context="repl") is not None
+    def shell():
+        """Authorize command if requested through the shell."""
+        return roax.context.last(context="shell") is not None
 
     @staticmethod
     def op():
@@ -138,12 +154,18 @@ class DataclassMapping(collections.abc.Mapping):
 
 
 class Processor:
+    """TODO: Description."""
+
     def __init__(self, channel):
         self.channel = channel
         self.commands = self._commands()
         self.users = DataclassMapping(self.channel.users, "nick", insensitive=True)
         self.phones = DataclassMapping(self.channel.phones, "number")
-        self.backend = None  # FIXME
+        try:
+            self.backend = vokiz.backends.load(channel.backend)
+        except BackendError as be:
+            print(f"Backend error: {be}.")
+            self.backend = vokiz.backends.none.SMS()  # use dummy backend
 
     def _commands(self):
         """Return name-to-method mapping of commands."""
@@ -153,31 +175,89 @@ class Processor:
             name, method = member[0], member[1]
             cmd = getattr(method.__func__, "_command", None)
             if cmd:
+                name = cmd.name or name
                 result[name] = method
         return result
 
-    def process(self, line):
+    def eval(self, line):
         if not line:
             return
-        elif line.startswith("/"):
-            line = line[1:]
-            args = shlex.split(line)
-            if args:
-                command = args.pop(0)
-                return self.execute(command, *args)
-        elif not line.startswith("@"):
-            pass
-        else:
-            pass
+        try:
+            if line.startswith("/"):
+                line = line[1:]
+                args = shlex.split(line)
+                if not args:
+                    raise Error(f"Missing command.")
+                try:
+                    command = args.pop(0)
+                    method = self.commands.get(command)
+                    if not method:
+                        raise Unauthorized
+                    return method(*args)
+                except Unauthorized:
+                    return f"Unknown commnd: {command}."
+                except TypeError:
+                    return self.usage(method)
+            if not line.startswith("@"):
+                if auth.shell():
+                    raise Error(
+                        f"Cowardly refusing to send message without explicit @nick."
+                    )
+                line = f"@{self.channel.rcpt} {line}"
+            nick, message = f"{line} ".split(" ", 1)
+            self.send(nick[1:], message)
+        except Error as e:
+            return f"Error: {e}"
 
-    def repl(self, nick):
+    def send(self, nick, message):
+        try:
+            nick = self.users[nick].nick
+        except KeyError:
+            for alias in [
+                getattr(self.channel.aliases, attr)
+                for attr in self.channel.aliases.__annotations__
+            ]:
+                if alias.lower() == nick.lower():
+                    nick = alias
+                    break
+        message = message.strip()
+        if not message:
+            raise Error(f"Refusing to send empty message to {nick}.")
+        header = self.channel.head.format_map({"from": ctx("user").nick, "to": nick})
+        phones = self._resolve(nick)
+        if not phones:
+            raise Error(f"No such nick: {nick}.")
+        for phone in phones:
+            self._send(phone, f"{header}{message}")
+
+    def _resolve(self, nick):
+        """Return list of phones associated with a nick, including aliases."""
+        return [
+            phone
+            for phone in self.phones.values()
+            if nick == self.channel.aliases.all
+            or phone.nick == nick
+            or (nick == self.channel.aliases.ops and self.users[phone.nick].op)
+        ]
+
+    def _send(self, phone, message):
+        """Send a message to a phone."""
+        if phone.mute:
+            return
+        print(f"[S] {phone.number}: {message}")
+        try:
+            self.backend.send(phone.number, message)
+        except BackendError as error:
+            print(f"[E] Error sending to {phone.number}: {error}.")  # FIXME: log
+
+    def shell(self, nick):
         prompt = f"{nick}@{self.channel.id}: "
         user = vokiz.resource.User(nick, True, True)
-        with roax.context.push(context="repl"):
+        with roax.context.push(context="shell"):
             with roax.context.push(context="user", user=user):
                 while True:
                     try:
-                        result = self.process(input(prompt))
+                        result = self.eval(input(prompt))
                         if result:
                             print(result)
                     except (EOFError, KeyboardInterrupt):
@@ -185,20 +265,6 @@ class Processor:
                         break
                     except Exit:
                         break
-
-    def execute(self, name, *args):
-        """Execute command with arguments and return response."""
-        try:
-            method = self.commands.get(name)
-            if not method:
-                raise Unauthorized
-            return method(*args)
-        except Error as e:
-            return f"Error: {e}"
-        except Unauthorized:
-            return f"Unknown command: {name}."
-        except TypeError:
-            return self.usage(method)
 
     def usage(self, method):
         """Return usage for method."""
@@ -212,17 +278,31 @@ class Processor:
             elements.append(name)
         return f"Usage: {' '.join(elements)}."
 
-    def send(self, nick, message):
-        user = ctx("user")
-        header = self.channel.head.format_map({"from": user.nick, "to": nick})
-        body = f"{header}{message}"
-        print(body)
-        # TODO: send!
+    def notify(self, event):
+        message = f"{ctx('user').nick} {event}."
+        phones = self._resolve(self.channel.aliases.ops)
+        for phone in phones:
+            self._send(phone, message)
+        else:
+            print(f"[I] {message}")
 
-    def notify(self, sendto, event):
-        body = f"{ctx('user').nick} {event}."
-        print(body)
-        # TODO: send!
+    def process(self):
+        """Process incoming messages."""
+        with roax.context.push(context="process"):
+            for number, message in self.backend.receive():
+                print(f"[R] {number}: {message}")
+                phone = self.phones.get(number)
+                if not phone:  # ignore messages from unregistered numbers
+                    continue
+                try:
+                    user = self.users[phone.nick]
+                except KeyError:
+                    continue
+                with roax.context.push(context="phone", phone=phone):
+                    with roax.context.push(context="user", user=user):
+                        response = self.eval(message)
+                        if response:
+                            self._send(phone, response)
 
     # ---- user commands -----
 
@@ -231,10 +311,10 @@ class Processor:
         """Disable receiving messages."""
         phone = ctx("phone")
         if phone.mute:
-            raise Error(f"Channel is already muted.")
+            raise Error(f"Channel is already muted. Use /unmute to unmute.")
         phone.mute = True
-        self.notify("_ops", f"muted channel on {phone.number}")
-        return f"Channel muted on {phone.number}. Use /unmute to renable."
+        self.notify(f"muted channel on {phone.number}")
+        return f"Channel muted on {phone.number}. Use /unmute to unmute."
 
     @cmd(auth.phone)
     def unmute(self):
@@ -243,14 +323,14 @@ class Processor:
         if not phone.mute:
             raise Error(f"Channel is not muted.")
         phone.mute = False
-        self.notify("_ops", f"unmuted channel on {phone.number}")
+        self.notify(f"unmuted channel on {phone.number}")
         return f"Channel unmuted on {phone.number}."
 
     @cmd()
     def who(self, nick=None):
         """List users or get user information."""
         if not nick or not auth.op():
-            return f"Users: {listing(self.users)}."
+            return f"Users: {_str_list(self.users)}."
         try:
             user = self.users[nick]
         except KeyError:
@@ -258,7 +338,9 @@ class Processor:
         result = [f"User: {user.nick}{' [op]' if user.op else ''}"]
         if auth.op():
             result.append(
-                listing([p.number for p in self.phones.values() if p.nick == user.nick])
+                _str_list(
+                    [p.number for p in self.phones.values() if p.nick == user.nick]
+                )
             )
         return " ".join(result) + "."
 
@@ -277,7 +359,7 @@ class Processor:
             if method.__func__._command.auth():
                 valid.append(name)
         if not command:
-            return f"Commands: {listing(valid)}."
+            return f"Commands: {_str_list(valid)}."
         elif command in valid:
             method = self.commands[command]
             return f"{self.usage(method)} {method.__doc__}"
@@ -289,17 +371,22 @@ class Processor:
     @cmd(auth.op)
     def add(self, number: vs.e164(), nick: vs.nick()):
         """Add member to channel."""
-        if nick.startswith("_"):
-            raise Error(f"Invalid nick: {nick}.")
         if number in self.phones:
-            raise Error(f"Number already registered: {number}.")
+            raise Error(
+                f"{number} is already registered to {self.phones[number].nick}."
+            )
+        if nick.lower() in (
+            self.channel.aliases.all.lower(),
+            self.channel.aliases.ops.lower(),
+        ):
+            raise Error(f"Nick unavailable: {nick}.")
         try:
             user = self.users[nick]
         except KeyError:
             user = vokiz.resource.User(nick)
             self.users.add(user)
         self.phones.add(vokiz.resource.Phone(number, user.nick))
-        self.notify("_ops", f"added {number} as {user.nick}")
+        self.notify(f"added {number} as {user.nick}")
 
     @cmd(auth.op)
     def remove(self, number: vs.e164()):
@@ -313,7 +400,7 @@ class Processor:
         if user and not [p for p in self.phones.values() if p.nick == phone.nick]:
             del self.users[user.nick]  # delete orphan user
         nick_msg = f" ({user.nick})" if user else ""
-        self.notify("_ops", f"removed {number}{nick_msg} from channel")
+        self.notify(f"removed {number}{nick_msg} from channel")
 
     @cmd(auth.op)
     def op(self, nick: vs.nick() = None):
@@ -323,7 +410,7 @@ class Processor:
             for nick in self.users:
                 if self.users[nick].op:
                     result.append(nick)
-            return f"Operators: {listing(result)}."
+            return f"Operators: {_str_list(result)}."
         try:
             user = self.users[nick]
         except KeyError:
@@ -331,7 +418,7 @@ class Processor:
         if user.op:
             raise Error(f"User {user.nick} is already channel operator.")
         user.op = True
-        self.notify("_ops", f"promoted {user.nick} to channel operator")
+        self.notify(f"promoted {user.nick} to channel operator")
 
     @cmd(auth.op)
     def deop(self, nick: vs.nick()):
@@ -342,13 +429,19 @@ class Processor:
             raise Error(f"No such user: {nick}.")
         if not user.op:
             raise Error(f"User {user.nick} is not channel operator.")
-        self.notify("_ops", f"demoted {user.nick} to channel user")
+        self.notify(f"demoted {user.nick} to channel user")
         user.op = False
 
     @cmd(auth.op)
     def alias(self, **kwargs):
         """Get or set alias."""
-        return "Aliases: all=QST ops=OPS."
+        if not kwargs:
+            return f"Aliases: {_str_dataclass(self.channel.aliases)}."
+        for key, value in kwargs.items():
+            if key.lower() not in self.channel.aliases.__annotations__:
+                raise Error(f"Unsupported alias: {key}.")
+            setattr(self.channel.aliases, key, value)
+        self.notify(f"set aliase: {_str_dict(kwargs)}")
 
     @cmd(auth.op)
     def head(self, value=None):
@@ -360,21 +453,32 @@ class Processor:
         except KeyError:
             raise Error("Only {from} and {to} fields can be expressed in header.")
         self.channel.head = value
-        self.notify("_ops", f'set message header to: "{value}"')
+        self.notify(f'set message header to: "{value}"')
 
     @cmd(auth.op)
-    def cast(self, nick: vs.nick() = None):
-        """Get or set route for unaddressed messages."""
+    def rcpt(self, nick: vs.nick() = None):
+        """Get or set recipient of unaddressed messages."""
         return f"Unaddressed messages go to: QST."
 
     # ----- REPL commands -----
 
-    @cmd(auth.repl)
+    @cmd(auth.shell)
     def exit(self):
         """Exit the channel."""
         raise Exit
 
-    @cmd(auth.repl)
+    @cmd(auth.shell)
     def backend(self, module=None, **kwargs):
         """Get or set backend config."""
-        return f"Backend: voipms did=6045551212 user=a pass=b."
+        if not module:
+            data = self.channel.backend
+            kwargs = _str_dict(data.kwargs)
+            return f"Backend: {data.module}{' ' if kwargs else ''}{kwargs}."
+        else:
+            data = vokiz.resource.Backend(module, kwargs)
+            try:
+                self.backend = vokiz.backends.load(data)
+            except BackendError as be:
+                raise Error(f"{be}.")
+            self.channel.backend = data
+            return "Backend successfully set."

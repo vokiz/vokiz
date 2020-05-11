@@ -4,7 +4,7 @@ build-backend = "poetry.masonry.api"
 
 [tool.black]
 line-length = 88
-target-version = ['py36', 'py37', 'py38']
+target-version = ['py38']
 
 [tool.poetry]
 name = "vokiz"
@@ -23,7 +23,9 @@ classifiers = [
 [tool.poetry.dependencies]
 click = "^7.1"
 python = "^3.8"
+requests = "^2.23"
 roax = "^2.0a8"
+toml = "^0.10"
 wrapt = "^1.12"
 
 [tool.poetry.dev-dependencies]

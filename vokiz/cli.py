@@ -65,18 +65,18 @@ def list_():
 def enter(channel, nick):
     """Enter channel via command line."""
     ch = resources.channels.read(channel)
-    print(f"Entering channel: {ch.id}.")
-    vokiz.processor.Processor(ch).repl(nick)
-    print("Writing channel configuration...")
+    vokiz.processor.Processor(ch).shell(nick)
     resources.channels.update(ch.id, ch)
 
 
 @cli.command()
-@click.argument("channel", required=False)
+@click.argument("channel")
 @handle_NotFound
 def process(channel):
     """Perform channel processing."""
-    print(f"channel={channel}")
+    ch = resources.channels.read(channel)
+    vokiz.processor.Processor(ch).process()
+    resources.channels.update(ch.id, ch)
 
 
 def main():
