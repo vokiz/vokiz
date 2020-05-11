@@ -93,7 +93,12 @@ def _str_dict(d):
 
 def _str_dataclass(o):
     """Return a string representing attributes in a dataclass."""
-    return _str_dict({attr: getattr(o, attr) for attr in o.__annotations__})
+    return _str_dict(_dict_dataclass(o))
+
+
+def _dict_dataclass(o):
+    """Return a dict representing attributes in a dataclass."""
+    return {attr: getattr(o, attr) for attr in o.__annotations__}
 
 
 class auth:
@@ -213,10 +218,7 @@ class Processor:
         try:
             nick = self.users[nick].nick
         except KeyError:
-            for alias in [
-                getattr(self.channel.aliases, attr)
-                for attr in self.channel.aliases.__annotations__
-            ]:
+            for alias in _dict_dataclass(self.channel.aliases).values():
                 if alias.lower() == nick.lower():
                     nick = alias
                     break
@@ -281,10 +283,10 @@ class Processor:
     def notify(self, event):
         message = f"{ctx('user').nick} {event}."
         phones = self._resolve(self.channel.aliases.ops)
+        if not phones:
+            print(f"[I] {message}")
         for phone in phones:
             self._send(phone, message)
-        else:
-            print(f"[I] {message}")
 
     def process(self):
         """Process incoming messages."""
@@ -348,7 +350,7 @@ class Processor:
     def ping(self):
         """Ping the service to confirm access."""
         phone = ctx("phone")
-        source = phone.number if phone else "REPL"
+        source = phone.number if phone else "shell"
         return f"Ping received from {ctx('user').nick} via {source}."
 
     @cmd()
@@ -368,6 +370,10 @@ class Processor:
 
     # ----- operator commands -----
 
+    def _aliases(self):
+        """Represents aliases as a dictionary."""
+        return {}
+
     @cmd(auth.op)
     def add(self, number: vs.e164(), nick: vs.nick()):
         """Add member to channel."""
@@ -375,18 +381,16 @@ class Processor:
             raise Error(
                 f"{number} is already registered to {self.phones[number].nick}."
             )
-        if nick.lower() in (
-            self.channel.aliases.all.lower(),
-            self.channel.aliases.ops.lower(),
-        ):
-            raise Error(f"Nick unavailable: {nick}.")
+        for alias in _dict_dataclass(self.channel.aliases).values():
+            if alias.lower() == nick.lower():
+                raise Error(f"Nick unavailable: {nick}.")
         try:
             user = self.users[nick]
         except KeyError:
             user = vokiz.resource.User(nick)
             self.users.add(user)
         self.phones.add(vokiz.resource.Phone(number, user.nick))
-        self.notify(f"added {number} as {user.nick}")
+        self.notify(f"added {number} ({user.nick})")
 
     @cmd(auth.op)
     def remove(self, number: vs.e164()):
@@ -400,7 +404,7 @@ class Processor:
         if user and not [p for p in self.phones.values() if p.nick == phone.nick]:
             del self.users[user.nick]  # delete orphan user
         nick_msg = f" ({user.nick})" if user else ""
-        self.notify(f"removed {number}{nick_msg} from channel")
+        self.notify(f"removed {number}{nick_msg}")
 
     @cmd(auth.op)
     def op(self, nick: vs.nick() = None):
@@ -438,10 +442,14 @@ class Processor:
         if not kwargs:
             return f"Aliases: {_str_dataclass(self.channel.aliases)}."
         for key, value in kwargs.items():
-            if key.lower() not in self.channel.aliases.__annotations__:
+            if key not in _dict_dataclass(self.channel.aliases).keys():
                 raise Error(f"Unsupported alias: {key}.")
+            if value in self.users:
+                raise Error(
+                    f"User already has nick assigned: {self.users[value].nick}."
+                )
             setattr(self.channel.aliases, key, value)
-        self.notify(f"set aliase: {_str_dict(kwargs)}")
+        self.notify(f"set alias: {_str_dict(kwargs)}")
 
     @cmd(auth.op)
     def head(self, value=None):
@@ -458,7 +466,8 @@ class Processor:
     @cmd(auth.op)
     def rcpt(self, nick: vs.nick() = None):
         """Get or set recipient of unaddressed messages."""
-        return f"Unaddressed messages go to: QST."
+        if not nick:
+            return f"Default recipient: {self.channel.rcpt}."
 
     # ----- REPL commands -----
 

@@ -62,8 +62,8 @@ def list_():
     "--nick", help="Nick to use in channel.", default="Admin", show_default=True
 )
 @handle_NotFound
-def enter(channel, nick):
-    """Enter channel via command line."""
+def shell(channel, nick):
+    """Enter channel via command line shell."""
     ch = resources.channels.read(channel)
     vokiz.processor.Processor(ch).shell(nick)
     resources.channels.update(ch.id, ch)
